@@ -22,7 +22,13 @@ HashMap::HashMap(const std::string& persistenceFile) : capacity(INITIAL_CAPACITY
 
     if (!persistenceFile.empty())
     {
-        Persistence::loadFromFile(*this,persistenceFile);
+        try{
+            Persistence::loadFromFile(*this,persistenceFile);
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr<<"Failed to load from persistence file" <<e.what() <<std::endl;
+        }
     }
 }
 
@@ -43,8 +49,13 @@ HashMap::~HashMap()
         for (auto& thread : workerThreads) {
             if (thread.joinable()) thread.join();
         }
-
-        Persistence::saveToFile(*this, "hashmap.json");
+        try {
+            Persistence::saveToFile(*this, "hashmap.json");
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Falied to save to persistence file:"<<e.what() <<std::endl;
+        }
 
         for (auto* head : table) {
             deleteList(head);
@@ -61,14 +72,16 @@ void HashMap::workerFunction()
         std::shared_ptr<Task> task;
         {
             std::unique_lock<std::mutex> lock(taskMutex);
-            taskCV.wait(lock,[this]{
+            if (taskCV.wait_for(lock,std::chrono::second(1),[this]{
                 return !taskQueue.empty() || !workersRunning;
-            });
-
-            if (!workersRunning) break;
-            task = taskQueue.front();
-            taskQueue.pop();
+            }))
+            {
+                if (!workersRunning) break;
+                task=taskQueue.front();
+                taskQueue.pop();
+            }
         }
+        if (!task) continue;
 
         switch(task->type)
         {
@@ -115,7 +128,18 @@ std::string HashMap::get(const std::string &key)
     }
     taskCV.notify_one();
 
-    return future.get();
+    try{
+        auto status = future.wait_for(std::chrono::milliseconds(500));
+        if (status == std::future_status::timeout)
+        {
+            return "Operation Timed out";
+        }
+        return future.get();
+    }
+    catch (const std::exception &e)
+    {
+        return "Error: "+std::string(e.what());
+    }
 }
 
 bool HashMap::remove(const std::string &key)
@@ -128,7 +152,19 @@ bool HashMap::remove(const std::string &key)
     }
     taskCV.notify_one();
 
-    return future.get()=="true";
+    try{
+        auto status = future.wait_for(std::chrono::milliseconds(500));
+        if (status==std::future_status::timeout)
+        {
+            return false;
+        }
+        return future.get()=="true";
+    }
+    catch(const std::exception& e)
+    {
+        std::cerr<<"Error in remove:" << e.what() <<std::endl;
+        return false;
+    }
 }
 
 
@@ -160,6 +196,10 @@ void HashMap::setInternal(const std::string &key, const std::string &value, int 
 
                 head->lastAccessed = time(nullptr);
                 updateLRU(key);
+
+                if (ttl>0) {
+                    updateExpiryQueue(key,expiry);
+                }
                 return;
             }
             prev=head;
@@ -181,18 +221,34 @@ void HashMap::setInternal(const std::string &key, const std::string &value, int 
 
     if (ttl>0)
     {
-        std::lock_guard<std::mutex> lock(expiryMutex);
-        bool shouldNotify = expiryQueue.empty() || expiry<expiryQueue.top().first;
-        expiryQueue.emplace(expiry,key);
-        if (shouldNotify)
-        {
-            expiryCV.notify_all();
-        }
+        updateExpiryQueue(key,expiry);
     }
     
     if (static_cast<float>(size) / capacity > 0.75 && capacity*2<=MAX_CAPACITY)
     {
         resize(capacity * 2);
+    }
+}
+
+void HashMap::updateExpiryQueue(const std::string& key, time_t expiry)
+{
+    std::lock_guard<std::mutex> lock(expiryMutex);
+
+    auto current =expiryQueue;
+
+    while (!current.empty())
+    {
+        if (current.top().second==key)
+        {
+            current.pop();
+        }
+    }
+
+    bool shouldNotify = expiryQueue.empty() || expiry < expiryQueue.top().first;
+    expiryQueue.emplace(expiry,key);
+
+    if (shouldNotify){
+        expiryCV.notify_all();
     }
 }
 

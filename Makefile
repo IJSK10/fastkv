@@ -3,7 +3,7 @@ CXX = g++
 CXXFLAGS = -Wall -std=c++17 -pthread -I C:/msys64/mingw64/include -I C:/vcpkg/installed/x64-windows/include
 
 # Source Files
-SRC = main.cpp hash_map.cpp fnv_hash.cpp persistence.cpp server.cpp
+SRC = main.cpp hash_map.cpp fnv_hash.cpp persistence.cpp server.cpp hash_map_rcu.cpp
 OBJ = $(SRC:.cpp=.o)
 
 # Output Binary

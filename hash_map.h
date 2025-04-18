@@ -82,6 +82,7 @@ private:
 
     void resize(size_t new_capacity);
     void cleanupExpired();
+    void updateExpiryQueue(const std::string& key, time_t expiry);
     void deleteList(Node *head);
     size_t hashFunction(const std::string& key,size_t cap) const {
         return fnv1a_hash(key)%cap;

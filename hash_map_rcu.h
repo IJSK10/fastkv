@@ -17,8 +17,8 @@
 #include <memory>
 #include <shared_mutex>
 
-const size_t INTIAL_CAPACITY = 2048;
-const size_t MIN_CAPACITY = 16;
+const size_t INITIAL_CAPACITY = 2048;
+const size_t MIN_CAPACITY = 2048;
 const size_t MAX_CAPACITY = 2048;
 
 class HashMap
@@ -72,6 +72,10 @@ class HashMap
     std::atomic<bool> running;
     std::thread cleanupThread;
 
+
+    void safeDelete(Node* node);
+
+
     //LRU
     std::list<std::string> lruList;
     std::unordered_map<std::string, std::list<std::string> ::iterator> lruMap;
@@ -79,6 +83,7 @@ class HashMap
     std::thread lruThread;
     std::atomic<bool> lruRunning;
     std::condition_variable lruCV;
+    void removeLRUKey(const std::string& key);
 
     //Expiry Management
     std::priority_queue<std::pair<time_t,std::string>, std::vector<std::pair<time_t,std::string>>,std::greater<>> expiryQueue;
@@ -86,6 +91,7 @@ class HashMap
     std::condition_variable_any expiryCV;
 
     //Worker pool
+    std::atomic<bool> workersRunning;
     std::vector<std::thread> workerThread;
     std::queue<std::shared_ptr<Task>> taskQueue;
     std::mutex taskMutex;

@@ -4,10 +4,11 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include "persistence.h"
 
 using namespace std::chrono;
 
-HashMap:: HashMap(const std::string &persistenceFile) : capacity(INITIAL_CAPACITY), size(0), table(INTIAL_CAPACITY), running(true), lruRunning(true), workersRunning(true)
+HashMap:: HashMap(const std::string &persistenceFile) : capacity(INITIAL_CAPACITY), size(0), table(INITIAL_CAPACITY), running(true), lruRunning(true), workersRunning(true)
 {
     cleanupThread = std::thread(&HashMap::cleanupExpired, this);
     lruThread = std::thread(&HashMap::lruMonitor,this);
@@ -118,7 +119,7 @@ void HashMap::setInternal(const std::string &key, const std::string &val,int ttl
 
     if (head)
     {
-        indrementRefCount(head);
+        incrementRefCount(head);
     }
 
     while (current)
@@ -132,7 +133,7 @@ void HashMap::setInternal(const std::string &key, const std::string &val,int ttl
 
         if (current->key==key)
         {
-            time_t expiryTime == tll ? time(nullptr) + ttl : 0;
+            time_t expiryTime = ttl ? time(nullptr) + ttl : 0;
             Node* newNode = new Node(key,val,expiryTime);
 
             newNode->next.store(nextNode);
@@ -258,7 +259,7 @@ bool HashMap::removeInternal(const std::string & key)
             {
                 table[index].store(nextNode);
             }
-            NodeToDelete = current;
+            nodeToDelete = current;
             removeLRUKey(key);
     
             size--;
@@ -517,15 +518,15 @@ void HashMap::print_map()
     }
 }
 
-std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const
-{
-    std::vector<std::pair<std::string, Node>> result;
-    for (size_t i = 0; i < capacity; ++i)
-    {
-        for (Node *node = table[i].load(); node; node = node->next)
-        {
-            result.emplace_back(node->key, *node);
-        }
-    }
-    return result;
-}
+// std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const
+// {
+//     std::vector<std::pair<std::string, Node>> result;
+//     for (size_t i = 0; i < capacity; ++i)
+//     {
+//         for (Node *node = table[i].load(); node; node = node->next)
+//         {
+//             result.emplace_back(node->key, *node);
+//         }
+//     }
+//     return result;
+// }

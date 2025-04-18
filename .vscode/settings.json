@@ -83,7 +83,11 @@
         "coroutine": "cpp",
         "resumable": "cpp",
         "future": "cpp",
-        "random": "cpp"
+        "random": "cpp",
+        "csignal": "cpp",
+        "cstdarg": "cpp",
+        "source_location": "cpp",
+        "variant": "cpp"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

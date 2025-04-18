@@ -72,7 +72,7 @@ void HashMap::workerFunction()
         std::shared_ptr<Task> task;
         {
             std::unique_lock<std::mutex> lock(taskMutex);
-            if (taskCV.wait_for(lock,std::chrono::second(1),[this]{
+            if (taskCV.wait_for(lock,std::chrono::seconds(1),[this]{
                 return !taskQueue.empty() || !workersRunning;
             }))
             {

@@ -20,16 +20,16 @@ HashMap::HashMap(const std::string& persistenceFile) : capacity(INITIAL_CAPACITY
         workerThreads.emplace_back(&HashMap::workerFunction, this);
     }
 
-    if (!persistenceFile.empty())
-    {
-        try{
-            Persistence::loadFromFile(*this,persistenceFile);
-        }
-        catch (const std::exception& e)
-        {
-            std::cerr<<"Failed to load from persistence file" <<e.what() <<std::endl;
-        }
-    }
+    // if (!persistenceFile.empty())
+    // {
+    //     try{
+    //         Persistence::loadFromFile(*this,persistenceFile);
+    //     }
+    //     catch (const std::exception& e)
+    //     {
+    //         std::cerr<<"Failed to load from persistence file" <<e.what() <<std::endl;
+    //     }
+    // }
 }
 
 HashMap::~HashMap()

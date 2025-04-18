@@ -34,22 +34,22 @@ bool Persistence::saveToFile(const HashMap& map, const std::string& fileName)
 
 bool Persistence::loadFromFile(HashMap& map,const std::string& fileName)
 {
-    std::ifstream infile(fileName);
-    if(!infile.is_open())
-    {
-        std::cerr<<"falied to open file for reading"<<std::endl;
-        return false;
-    }
-    nlohmann::json j;
-    infile >> j;
-    for (auto& [key,value]:j.items())
-    {
-        std::string val=value["value"];
-        time_t expiry = value.contains("expiry") ? static_cast<time_t>(value["expiry"].get<std::int64_t>()) : 0;
-        map.set(key, val, static_cast<int>(expiry));
-    }
+    // std::ifstream infile(fileName);
+    // if(!infile.is_open())
+    // {
+    //     std::cerr<<"falied to open file for reading"<<std::endl;
+    //     return false;
+    // }
+    // nlohmann::json j;
+    // infile >> j;
+    // for (auto& [key,value]:j.items())
+    // {
+    //     std::string val=value["value"];
+    //     time_t expiry = value.contains("expiry") ? static_cast<time_t>(value["expiry"].get<std::int64_t>()) : 0;
+    //     map.set(key, val, static_cast<int>(expiry));
+    // }
 
-    infile.close();
+    // infile.close();
     return true;
 }
 

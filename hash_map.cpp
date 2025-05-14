@@ -4,90 +4,110 @@
 #include <thread>
 #include "persistence.h"
 
-HashMap::HashMap(const std::string& persistenceFile) : capacity(INITIAL_CAPACITY), size(0), running(true), lruRunning(true), workersRunning(true)
+HashMap::HashMap(const std::string &persistenceFile) : capacity(INITIAL_CAPACITY), size(0), running(true), lruRunning(true), workersRunning(true)
 {
     table.resize(capacity, nullptr);
     bucketLocks = std::vector<std::shared_mutex>(capacity);
 
-    //start cleanupthread
+    // start cleanupthread
     cleanupThread = std::thread(&HashMap::cleanupExpired, this);
 
-    //start LRU Thread
-    lruThread = std::thread(&HashMap::lruMonitor,this);
+    // start LRU Thread
+    lruThread = std::thread(&HashMap::lruMonitor, this);
 
-    for (int i=0;i<3;i++)
+    for (int i = 0; i < 3; i++)
     {
         workerThreads.emplace_back(&HashMap::workerFunction, this);
     }
 
-    // if (!persistenceFile.empty())
-    // {
-    //     try{
-    //         Persistence::loadFromFile(*this,persistenceFile);
-    //     }
-    //     catch (const std::exception& e)
-    //     {
-    //         std::cerr<<"Failed to load from persistence file" <<e.what() <<std::endl;
-    //     }
-    // }
+    if (!persistenceFile.empty())
+    {
+        Persistence::loadFromFile(*this, persistenceFile);
+    }
 }
 
 HashMap::~HashMap()
 {
-    try {
+    try
+    {
         running = false;
         lruRunning = false;
         workersRunning = false;
-        
+
         expiryCV.notify_all();
         lruCV.notify_all();
         taskCV.notify_all();
 
-        if (cleanupThread.joinable()) cleanupThread.join();
-        if (lruThread.joinable()) lruThread.join();
-        
-        for (auto& thread : workerThreads) {
-            if (thread.joinable()) thread.join();
+        if (cleanupThread.joinable())
+            cleanupThread.join();
+        if (lruThread.joinable())
+            lruThread.join();
+
+        for (auto &thread : workerThreads)
+        {
+            if (thread.joinable())
+                thread.join();
         }
-        try {
+        try
+        {
             Persistence::saveToFile(*this, "hashmap.json");
         }
-        catch (const std::exception& e)
+        catch (const std::exception &e)
         {
-            std::cerr << "Falied to save to persistence file:"<<e.what() <<std::endl;
+            std::cerr << "Falied to save to persistence file:" << e.what() << std::endl;
         }
 
-        for (auto* head : table) {
-            deleteList(head);
+        for (size_t i = 0; i < table.size(); ++i) {
+            deleteList(table[i]);
+            table[i] = nullptr;
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception &e)
+    {
         std::cerr << "Exception in HashMap destructor: " << e.what() << std::endl;
     }
 }
 
 void HashMap::workerFunction()
 {
-    while(workersRunning)
+    while (workersRunning)
     {
         std::shared_ptr<Task> task;
         {
             std::unique_lock<std::mutex> lock(taskMutex);
-            if (taskCV.wait_for(lock,std::chrono::seconds(1),[this]{
-                return !taskQueue.empty() || !workersRunning;
-            }))
+            if (taskCV.wait_for(lock, std::chrono::seconds(1), [this]
+                                { return !taskQueue.empty() || !workersRunning; }))
             {
-                if (!workersRunning) break;
-                task=taskQueue.front();
-                taskQueue.pop();
+                if (!workersRunning && taskQueue.empty())
+                {
+                    break; // Exit if shutting down and no more tasks
+                }
+                if (!taskQueue.empty())
+                {
+                    task = taskQueue.front();
+                    taskQueue.pop();
+                }
+                else
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                if (!workersRunning)
+                {
+                    break;
+                }
+                continue;
             }
         }
-        if (!task) continue;
-
-        switch(task->type)
+        if (task)
         {
+            switch (task->type)
+            {
             case TaskType::SET:
             {
-                setInternal(task->key,task->value,task->ttl);
+                setInternal(task->key, task->value, task->ttl);
                 break;
             }
             case TaskType::GET:
@@ -98,19 +118,17 @@ void HashMap::workerFunction()
             case TaskType::REMOVE:
             {
                 bool result = removeInternal(task->key);
-                task->result.set_value(result? "true" : "false");
+                task->result.set_value(result ? "true" : "false");
                 break;
+            }
             }
         }
     }
 }
 
-
-
-
-void HashMap::set(const std::string& key, const std::string &value,int ttl)
+void HashMap::set(const std::string &key, const std::string &value, int ttl)
 {
-    auto task = std::make_shared<Task>(TaskType::SET,key,value,ttl);
+    auto task = std::make_shared<Task>(TaskType::SET, key, value, ttl);
     {
         std::lock_guard<std::mutex> lock(taskMutex);
         taskQueue.push(task);
@@ -120,31 +138,7 @@ void HashMap::set(const std::string& key, const std::string &value,int ttl)
 
 std::string HashMap::get(const std::string &key)
 {
-    auto task = std::make_shared<Task>(TaskType::GET,key);
-    std::future<std::string> future=task->result.get_future();
-    {
-        std::lock_guard<std::mutex> lock(taskMutex);
-        taskQueue.push(task);
-    }
-    taskCV.notify_one();
-
-    try{
-        auto status = future.wait_for(std::chrono::milliseconds(500));
-        if (status == std::future_status::timeout)
-        {
-            return "Operation Timed out";
-        }
-        return future.get();
-    }
-    catch (const std::exception &e)
-    {
-        return "Error: "+std::string(e.what());
-    }
-}
-
-bool HashMap::remove(const std::string &key)
-{
-    auto task = std::make_shared<Task>(TaskType::REMOVE,key);
+    auto task = std::make_shared<Task>(TaskType::GET, key);
     std::future<std::string> future = task->result.get_future();
     {
         std::lock_guard<std::mutex> lock(taskMutex);
@@ -152,119 +146,149 @@ bool HashMap::remove(const std::string &key)
     }
     taskCV.notify_one();
 
-    try{
-        auto status = future.wait_for(std::chrono::milliseconds(500));
-        if (status==std::future_status::timeout)
+    try
+    {
+        return future.get(); // Blocks until worker sets the promise
+    }
+    catch (const std::future_error &e)
+    {
+        std::cerr << "Future error in get for key '" << key << "': " << e.what() << std::endl;
+        return "Error: Future error"; // Or throw, or return specific error string
+    }
+
+}
+
+bool HashMap::remove(const std::string &key)
+{
+    auto task = std::make_shared<Task>(TaskType::REMOVE, key);
+    std::future<std::string> future = task->result.get_future();
+    {
+        std::lock_guard<std::mutex> lock(taskMutex);
+        taskQueue.push(task);
+    }
+    taskCV.notify_one();
+
+
+    try
+    {
+        // Using the wait_for logic:
+        auto status = future.wait_for(std::chrono::milliseconds(1000)); // Increased timeout slightly
+        if (status == std::future_status::timeout)
         {
+            std::cerr << "Timeout waiting for remove operation on key: " << key << std::endl;
             return false;
         }
-        return future.get()=="true";
+        return future.get() == "true";
     }
-    catch(const std::exception& e)
+    catch (const std::future_error &e)
     {
-        std::cerr<<"Error in remove:" << e.what() <<std::endl;
+        std::cerr << "Future error in remove for key '" << key << "': " << e.what() << std::endl;
+        return false;
+    }
+    catch (const std::exception &e) // Catches other exceptions (e.g., if promise set with exception)
+    {
+        std::cerr << "Error in remove for key '" << key << "': " << e.what() << std::endl;
         return false;
     }
 }
 
-
-//Internal Implementation
+// Internal Implementation
 void HashMap::setInternal(const std::string &key, const std::string &value, int ttl)
 {
-    //std::cout<<"Insert Key:"<<key<<", Value:"<<value<<std::endl;   
-    size_t index = hashFunction(key,capacity);
+    size_t index = hashFunction(key, capacity);
     time_t expiry = ttl > 0 ? time(nullptr) + ttl : 0;
+    bool new_key_added=false;
 
-    if (size>=MAX_CAPACITY)
+    std::unique_lock<std::shared_mutex> lock(bucketLocks[index]);
+
+    Node *head = table[index];
+    Node *prev = nullptr;
+    bool key_found = false;
+
+    while (head)
     {
-        removeLRUItem();
-        size--;
+        if (head->key == key)
+        {
+            head->value = value;
+            head->expiry = expiry;
+            head->lastAccessed = time(nullptr);
+            lock.unlock();
+            updateLRU(key);
+            if (ttl > 0) {
+                updateExpiryQueue(key, expiry);
+            }
+            key_found = true;
+            return;
+        }
+        prev = head;
+        head = head->next;
     }
 
+    if (size.load(std::memory_order_acquire) >= MAX_CAPACITY)
     {
-        std::unique_lock<std::shared_mutex> lock(bucketLocks[index]);
-        
-        Node *head = table[index];
-        Node *prev = nullptr;
-        
-        while (head)
-        {
-            if (head->key == key)
-            {
-                head->value = value;
-                head->expiry = expiry;
-
-                head->lastAccessed = time(nullptr);
+        lock.unlock();
+        removeLRUItem();
+        lock.lock();
+        head = table[index];
+        prev = nullptr; 
+        while(head) {
+            if (head->key == key) {
+                head->value = value; head->expiry = expiry; head->lastAccessed = time(nullptr);
                 updateLRU(key);
-
-                if (ttl>0) {
-                    updateExpiryQueue(key,expiry);
-                }
+                if (ttl > 0) updateExpiryQueue(key, expiry);
                 return;
             }
-            prev=head;
+            prev = head;
             head = head->next;
         }
-        
-        Node *new_node = new Node(key, value, expiry);
-        if (prev)
-        {
-            prev->next=new_node;
-        }
-        else
-        {
-            table[index]=new_node;
-        }
-        size++;
-        updateLRU(key);
-    }
 
-    if (ttl>0)
+    }
+    Node *new_node = new Node(key, value, expiry);
+    new_node->lastAccessed = time(nullptr);
+    if (prev)
+    {
+        prev->next = new_node;
+    }
+    else
+    {
+        table[index] = new_node;
+    }
+    size.fetch_add(1, std::memory_order_release);
+    new_key_added = true;
+    updateLRU(key);
+    if (ttl > 0)
     {
         updateExpiryQueue(key,expiry);
     }
-    
-    if (static_cast<float>(size) / capacity > 0.75 && capacity*2<=MAX_CAPACITY)
-    {
-        resize(capacity * 2);
-    }
 }
 
-void HashMap::updateExpiryQueue(const std::string& key, time_t expiry)
+void HashMap::updateExpiryQueue(const std::string &key, time_t expiry)
 {
     std::lock_guard<std::mutex> lock(expiryMutex);
 
-    auto current =expiryQueue;
-
-    while (!current.empty())
-    {
-        if (current.top().second==key)
-        {
-            current.pop();
-        }
-    }
 
     bool shouldNotify = expiryQueue.empty() || expiry < expiryQueue.top().first;
-    expiryQueue.emplace(expiry,key);
+    expiryQueue.emplace(expiry, key);
 
-    if (shouldNotify){
+    if (shouldNotify)
+    {
         expiryCV.notify_all();
     }
 }
 
-
 std::string HashMap::getInternal(const std::string &key)
 {
-    size_t index = hashFunction(key,capacity);
-    
+    size_t index = hashFunction(key, capacity);
+
     std::shared_lock<std::shared_mutex> lock(bucketLocks[index]);
-    
+
     Node *head = table[index];
-    
+
     while (head)
     {
-        if (head->key == key){
-            if (head->expiry>0 && time(nullptr)>head->expiry)
+        if (head->key == key)
+        {
+            if (head->expiry > 0 && time(nullptr) > head->expiry)
             {
                 lock.unlock();
                 remove(key);
@@ -272,9 +296,10 @@ std::string HashMap::getInternal(const std::string &key)
             }
             else
             {
-                head->lastAccessed=time(nullptr);
+                head->lastAccessed = time(nullptr);
+                std::string val = head->value;
                 updateLRU(key);
-                return head->value;
+                return val;
             }
         }
         head = head->next;
@@ -284,7 +309,7 @@ std::string HashMap::getInternal(const std::string &key)
 
 bool HashMap::removeInternal(const std::string &key)
 {
-    size_t index = hashFunction(key,capacity);
+    size_t index = hashFunction(key, capacity);
     std::unique_lock<std::shared_mutex> lock(bucketLocks[index]);
 
     Node *head = table[index];
@@ -304,21 +329,15 @@ bool HashMap::removeInternal(const std::string &key)
             {
                 std::lock_guard<std::mutex> lruLock(lruMutex);
                 auto it = lruMap.find(key);
-                if (it!=lruMap.end())
+                if (it != lruMap.end())
                 {
                     lruList.erase(it->second);
                     lruMap.erase(it);
                 }
             }
             delete head;
-            size--;
+            size.fetch_sub(1, std::memory_order_release);
 
-            if ((float)size / capacity < 0.25 && capacity > MIN_CAPACITY)
-            {
-                lock.unlock();
-                resize(capacity / 2);
-            }
-            
             return true;
         }
         prev = head;
@@ -329,14 +348,13 @@ bool HashMap::removeInternal(const std::string &key)
 
 void HashMap::resize(size_t new_capacity)
 {
-    if (new_capacity < MIN_CAPACITY || new_capacity>MAX_CAPACITY)
+    if (new_capacity < MIN_CAPACITY || new_capacity > MAX_CAPACITY)
         return;
 
     std::lock_guard<std::mutex> lock(writelock);
 
     std::vector<Node *> new_table(new_capacity, nullptr);
     std::vector<std::shared_mutex> new_bucketLocks(new_capacity);
-    
 
     for (size_t i = 0; i < capacity; i++)
     {
@@ -344,7 +362,7 @@ void HashMap::resize(size_t new_capacity)
         while (head)
         {
             Node *next = head->next;
-            size_t new_index = hashFunction(head->key,new_capacity);
+            size_t new_index = hashFunction(head->key, new_capacity);
 
             head->next = new_table[new_index];
             new_table[new_index] = head;
@@ -352,48 +370,90 @@ void HashMap::resize(size_t new_capacity)
         }
     }
 
-    table =std::move(new_table);
-    bucketLocks=std::move(new_bucketLocks);
+    table = std::move(new_table);
+    bucketLocks = std::move(new_bucketLocks);
     capacity = new_capacity;
 }
 
-void HashMap::cleanupExpired() {
-    while (running) {
+void HashMap::cleanupExpired()
+{
+    while (running)
+    {
         std::unique_lock<std::mutex> lock(expiryMutex);
 
-        while (!expiryQueue.empty()) {
+        if (expiryQueue.empty() && running)
+        {
+            expiryCV.wait(lock, [this]
+                          { return !expiryQueue.empty() || !running; });
+        }
+
+        if (!running && expiryQueue.empty())
+            return;
+
+        if (!running && !expiryQueue.empty())
+        {
+            while (!expiryQueue.empty())
+            {
+                std::string key_to_remove = expiryQueue.top().second;
+                expiryQueue.pop();
+                lock.unlock();
+                remove(key_to_remove); // Queue removal task
+                lock.lock();
+                if (!running && expiryQueue.empty())
+                    return; // check again
+            }
+            if (!running)
+                return;
+        }
+
+        while (!expiryQueue.empty() && running)
+        {
             auto now = std::time(nullptr);
             auto nextExpiry = expiryQueue.top().first;
+            std::string key = expiryQueue.top().second;
 
-            if (nextExpiry > now) {
-                expiryCV.wait_until(lock, std::chrono::system_clock::from_time_t(nextExpiry));
+            if (nextExpiry > now)
+            {
+                auto wait_time = std::chrono::system_clock::from_time_t(nextExpiry);
+                if (expiryCV.wait_until(lock, wait_time, [this, nextExpiry]
+                                        { return !running || expiryQueue.empty() || expiryQueue.top().first < nextExpiry || expiryQueue.top().first <= std::time(nullptr); }))
+                {
+                }
             }
 
-            if (!running) return;
+            if (!running)
+                break;
 
-            if (!expiryQueue.empty() && expiryQueue.top().first <= std::time(nullptr)) {
-                std::string key = expiryQueue.top().second;
+            if (!expiryQueue.empty() && expiryQueue.top().first <= std::time(nullptr))
+            {
+                std::string key_to_remove = expiryQueue.top().second;
                 expiryQueue.pop();
 
-                lock.unlock();  // Unlock expiryMutex before calling remove()
-                remove(key);
-                lock.lock();    // Re-acquire expiryMutex for next iteration
+                lock.unlock();
+                remove(key_to_remove);
+                lock.lock();
+            }
+            else if (!expiryQueue.empty() && expiryQueue.top().first > std::time(nullptr))
+            {
+                continue;
+            }
+            else if (expiryQueue.empty())
+            {
+                break;
             }
         }
 
-        expiryCV.wait(lock);  // Wait for next expiry signal
     }
 }
 
-
-void HashMap::deleteList(Node* head)
+void HashMap::deleteList(Node *head)
 {
     while (head)
-        {
-            Node* temp=head;
-            head=head->next;
-            delete temp;
-        }
+    {
+        Node *temp = head;
+        head = head->next;
+        delete temp;
+    }
 }
 
 void HashMap::print_map()
@@ -413,13 +473,16 @@ void HashMap::print_map()
     }
 }
 
-std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const {
+std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const
+{
     std::vector<std::pair<std::string, Node>> allData;
-    allData.reserve(std::min(size.load(), static_cast<size_t>(10000))); // Limit size
-    
-    for (size_t i = 0; i < capacity; i++) {
-        Node* current = table[i];
-        while (current) {
+    allData.reserve(std::min(size.load(), static_cast<size_t>(10000)));
+
+    for (size_t i = 0; i < capacity; i++)
+    {
+        Node *current = table[i];
+        while (current)
+        {
             allData.push_back({current->key, *current});
             current = current->next;
         }
@@ -427,39 +490,47 @@ std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const {
     return allData;
 }
 
-void HashMap::updateLRU(const std::string& key)
+void HashMap::updateLRU(const std::string &key)
 {
     std::lock_guard<std::mutex> lock(lruMutex);
 
     auto it = lruMap.find(key);
-    if (it!=lruMap.end())
+    if (it != lruMap.end())
     {
         lruList.erase(it->second);
     }
 
     lruList.push_front(key);
-    lruMap[key]=lruList.begin();
+    lruMap[key] = lruList.begin();
 }
 
 void HashMap::removeLRUItem()
 {
     std::string lruKey;
+    bool item_to_remove = false;
     {
         std::lock_guard<std::mutex> lock(lruMutex);
-        if (lruList.empty()) return;
-
-        lruKey=lruList.back();
-        lruList.pop_back();
-        lruMap.erase(lruKey);
+        if (!lruList.empty())
+        {
+            lruKey = lruList.back();
+            lruList.pop_back();
+            lruMap.erase(lruKey);
+            item_to_remove = true;
+        }
     }
 
-    removeInternal(lruKey);
+    if (item_to_remove)
+    {
+        removeInternal(lruKey);
+    }
 }
 
 void HashMap::lruMonitor()
 {
     while (lruRunning)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (!lruRunning)
+            break;
     }
 }

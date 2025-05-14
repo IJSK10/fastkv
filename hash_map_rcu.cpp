@@ -1,22 +1,35 @@
 #include "hash_map_rcu.h"
 #include <iostream>
-#include <fstream>
-#include <sstream>
-#include <chrono>
-#include <thread>
+#include <algorithm>
+#include <vector>
 #include "persistence.h"
 
-using namespace std::chrono;
+inline void HashMap::incrementRefCount(Node* node) const{
+    if (node) {
+        node->refCount.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
-HashMap:: HashMap(const std::string &persistenceFile) : capacity(INITIAL_CAPACITY), size(0), table(INITIAL_CAPACITY), running(true), lruRunning(true), workersRunning(true)
+inline void HashMap::decrementRefCount(Node* node) const{
+    if (node) {
+        node->refCount.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+HashMap:: HashMap(const std::string &persistenceFile) : capacity(INITIAL_CAPACITY), size(0), running(true), lruRunning(true), workersRunning(true)
 {
-    cleanupThread = std::thread(&HashMap::cleanupExpired, this);
-    lruThread = std::thread(&HashMap::lruMonitor,this);
+    table = std::vector<std::atomic<Node*>>(this->capacity);
+
+    unsigned int num_workers = std::thread::hardware_concurrency();
+    if (num_workers == 0) num_workers = 2;
+
     for (int i=0;i<std::thread::hardware_concurrency();++i)
     {
         workerThread.emplace_back(&HashMap::workerFunction,this);
     }
-
+    
+    cleanupThread = std::thread(&HashMap::cleanupExpired, this);
+    lruThread = std::thread(&HashMap::lruMonitor,this);
     if (!persistenceFile.empty())
     {
         try{
@@ -33,19 +46,21 @@ HashMap::~HashMap()
 {
 
     running = false;
-    expiryCV.notify_all();
-    if (cleanupThread.joinable()) cleanupThread.join();
-
     lruRunning = false;
-    lruCV.notify_all();
-    if (lruThread.joinable()) lruThread.join();
+    workersRunning = false;
 
-    wokersRunning = false;
     taskCV.notify_all();
+    expiryGlobalCV.notify_all();
+    lruCV.notify_all();
+    
     for (auto &t: workerThread)
     {
         if (t.joinable()) t.join();
     }
+    if (cleanupThread.joinable()) cleanupThread.join();
+
+    if (lruThread.joinable()) lruThread.join();
+
 
     try {
         Persistence::saveToFile(*this, "hashmap.json");
@@ -55,22 +70,107 @@ HashMap::~HashMap()
         std::cerr << "Falied to save to persistence file:"<<e.what() <<std::endl;
     }
 
-    for (auto &bucket: table)
+    processDeferredDeletes(true);
+
+    for (size_t i = 0; i < table.size(); ++i) {
+        deleteList(table[i].load(std::memory_order_relaxed));
+        table[i].store(nullptr, std::memory_order_relaxed);
+    }
+}
+
+void HashMap::deleteList(Node* head) {
+    Node* current = head;
+    while (current) {
+        Node* temp = current;
+        current = current->next.load(std::memory_order_relaxed);
+        delete temp;
+    }
+}
+
+void HashMap::scheduleDeferredDelete(Node* node) {
+    if (!node) return;
+    std::lock_guard<std::mutex> lock(deferredDeleteMutex);
+    deferredDeleteQueue.push_back(node);
+}
+
+void HashMap::processDeferredDeletes(bool forceAll) {
+    std::vector<Node*> toDeleteNow;
     {
-        deleteList(bucket.load());
+        std::lock_guard<std::mutex> lock(deferredDeleteMutex);
+        if (deferredDeleteQueue.empty()) return;
+
+        deferredDeleteQueue.erase(
+            std::remove_if(deferredDeleteQueue.begin(), deferredDeleteQueue.end(),
+                           [&](Node* node) {
+                               if (node && node->refCount.load(std::memory_order_acquire) == 0) {
+                                   toDeleteNow.push_back(node);
+                                   return true;
+                               }
+                               if (forceAll && node && node->refCount.load(std::memory_order_acquire) > 0) {
+                                   std::cerr << "Warning: Node " << node->key << " has refCount "
+                                            << node->refCount.load() << " during forced delete processing." << std::endl;
+                               }
+                               return false;
+                           }),
+            deferredDeleteQueue.end());
+    }
+
+    for (Node* node : toDeleteNow) {
+        delete node;
+    }
+}
+
+void HashMap::workerFunction() {
+    while (workersRunning.load(std::memory_order_relaxed)) {
+        std::shared_ptr<Task> task;
+        {
+            std::unique_lock<std::mutex> lock(taskMutex);
+            taskCV.wait(lock, [&]() {
+                return !taskQueue.empty() || !workersRunning;
+            });
+            if (!workersRunning.load(std::memory_order_relaxed) && taskQueue.empty()) {
+                break;
+            }
+            if (taskQueue.empty()) { 
+                continue;
+            }
+            task = taskQueue.front();
+            taskQueue.pop();
+        }
+        if (task)
+        {
+            try {
+                switch (task->type) {
+                    case TaskType::SET:
+                        setInternal(task->key, task->value, task->ttl);
+                        // task->result.set_value("OK");
+                        break;
+                    case TaskType::GET:
+                        task->result.set_value(getInternal(task->key));
+                        break;
+                    case TaskType::REMOVE:
+                        task->result.set_value(removeInternal(task->key) ? "true" : "false");
+                        break;
+                }
+            } catch (const std::exception& e) {
+                try {
+                    task->result.set_exception(std::current_exception());
+                } catch (...) {
+
+                }
+            }
+        }
     }
 }
 
 void HashMap::set(const std::string &key, const std::string &value, int ttl)
 {
     auto task=std::make_shared<Task>(TaskType::SET, key, value, ttl);
-    std::future<std::string> future=task->result.get_future();
     {
         std::lock_guard<std::mutex> lock(taskMutex);
         taskQueue.push(task);
     }
     taskCV.notify_one();
-    future.get();
 }
 
 std::string HashMap::get(const std::string &key)
@@ -82,7 +182,15 @@ std::string HashMap::get(const std::string &key)
         taskQueue.push(task);
     }
     taskCV.notify_one();
-    return future.get();
+    try {
+        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+
+            return "Error: Timeout";
+        }
+        return future.get();
+    } catch (const std::exception& e) { 
+        return "Error: " + std::string(e.what());
+    }
 }
 
 bool HashMap::remove(const std::string &key)
@@ -94,344 +202,204 @@ bool HashMap::remove(const std::string &key)
         taskQueue.push(task);
     }
     taskCV.notify_one();
-    return future.get() == "OK";
-}
-
-void HashMap::safeDelete(Node* node)
-{
-    if (!node) return;
-
-    while (node->refCount > 0)
-    {
-        std::this_thread::yield();
+    try {
+        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+            return false;
+        }
+        return future.get() == "true";
+    } catch (const std::exception& e) {
+        return false;
     }
-    delete node;
 }
 
 void HashMap::setInternal(const std::string &key, const std::string &val,int ttl)
 {
     size_t index=hashFunction(key,capacity);
+    time_t expiry = ttl ? time(nullptr) + ttl : 0;
 
-    Node *head=table[index].load();
-    Node *prev=nullptr;
-    Node* current =head;
-    Node* nodeToDelete = nullptr;
+    Node* new_node = new Node(key, val, expiry);
 
-    if (head)
-    {
-        incrementRefCount(head);
-    }
+    Node* current_head;
+    Node* old_node_to_retire = nullptr;
+    
+    do {
+        current_head = table[index].load(std::memory_order_acquire);
+        Node* current = current_head;
+        Node* prev = nullptr;
+        old_node_to_retire = nullptr;
 
-    while (current)
-    {
-        Node* nextNode = current->next.load();
-
-        if (nextNode)
-        {
-            incrementRefCount(nextNode);
-        }
-
-        if (current->key==key)
-        {
-            time_t expiryTime = ttl ? time(nullptr) + ttl : 0;
-            Node* newNode = new Node(key,val,expiryTime);
-
-            newNode->next.store(nextNode);
-
-            if (prev)
-            {
-                prev->next.store(newNode);
+        while (current != nullptr) {
+            if (current->key == key) {
+                old_node_to_retire = current; 
+                break;
             }
-            else
-            {
-                table[index].store(newNode);
+            prev = current;
+            current = current->next.load(std::memory_order_acquire);
+        }
+
+        if (old_node_to_retire) {
+            new_node->next.store(old_node_to_retire->next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        } else {
+            new_node->next.store(current_head, std::memory_order_relaxed);
+        }
+
+        if (old_node_to_retire == current_head) {
+            if (table[index].compare_exchange_weak(current_head, new_node,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed)) {
+                if (old_node_to_retire) {
+                     scheduleDeferredDelete(old_node_to_retire);
+                }
+                updateLRU(key);
+                return;
             }
+        }
 
-            nodeToDelete = current;
-
-            updateLRU(key);
-            if (nextNode)
-            {
-                decrementRefCount(nextNode);
+        else if (old_node_to_retire == nullptr) {
+            if (table[index].compare_exchange_weak(current_head, new_node,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed)) {
+                size.fetch_add(1, std::memory_order_relaxed);
+                updateLRU(key);
+                return;
             }
-            break;
         }
 
-        if (prev)
-        {
-            decrementRefCount(prev);
+        else { 
+
+            if (prev && prev->next.compare_exchange_weak(old_node_to_retire, new_node,
+                                                        std::memory_order_release, std::memory_order_relaxed)) {
+                scheduleDeferredDelete(old_node_to_retire);
+                updateLRU(key);
+                return;
+            }
         }
 
-        prev=current;
-        current = nextNode;
-    }
-
-    if (!nodeToDelete)
-    {
-        time_t expiryTime = ttl ? time(nullptr) + ttl : 0;
-        Node* newNode = new Node(key,val,expiryTime);
-        newNode->next.store(head);
-        table[index].store(newNode);
-
-        size++;
-
-        updateLRU(key);
-
-        decrementRefCount(prev);
-    }
-    else
-    {
-        if (prev)
-        {
-            decrementRefCount(prev);
-        }
-        safeDelete(nodeToDelete);
-
-    }
+        } while (true);
 }
 
-std::string HashMap::getInternal(const std::string &key)
+std::string HashMap::getInternal(const std::string &key) const
 {
     size_t index=hashFunction(key, capacity);
-    Node* current = table[index].load();
-    if (current)
-    {
-        incrementRefCount(current);
-    }
+    std::string result_value = "Key not found";
+    time_t now = 0;
+    Node* current = table[index].load(std::memory_order_acquire);
+    incrementRefCount(current);
 
-    while (current)
+    while (current!=nullptr)
     {
         if (current->key == key)
         {
-            if (current->expiry && time(nullptr)> current->expiry)
+            if (now == 0) now = time(nullptr);
+            if (current->expiry!=0 && now> current->expiry)
             {
-                decrementRefCount(current);
-                return "";
+                result_value = "Key expired";
             }
-            current->lastAccessed= time(nullptr);
-            updateLRU(key);
+            else {
+                current->lastAccessed.store(now, std::memory_order_relaxed);
+                result_value = current->value;
+            }
             decrementRefCount(current);
-            return current->value;
+            return result_value;
         }
 
         Node* nextNode = current->next.load();
-        if (nextNode)
-        {
-            incrementRefCount(nextNode);
-        }
-        decrementRefCount(current);
-        current=nextNode;
+        incrementRefCount(nextNode); 
+        decrementRefCount(current); 
+        current = nextNode;
     }
-
-    if (current)
-    {
-        decrementRefCount(current);
-    }
-    return "";
+    return result_value;
 }
 
 bool HashMap::removeInternal(const std::string & key)
 {
     size_t index = hashFunction(key,capacity);
 
-    Node* head=table[index].load();
-    Node* prev=nullptr;
-    Node* current = head;
-    Node* nodeToDelete = nullptr;
+    Node* node_to_retire = nullptr;
+    Node* current_head;
 
-    if (current)
-    {
-        incrementRefCount(current);
-    }
+    do {
+        current_head = table[index].load(std::memory_order_acquire);
+        Node* current = current_head;
+        Node* prev = nullptr;
+        node_to_retire = nullptr;
 
-    while (current)
-    {
-        Node* nextNode = current->next.load();
-        incrementRefCount(nextNode);
-
-        if (current->key == key)
-        {
-            if (prev)
-            {
-                prev->next.store(nextNode);
+        while (current != nullptr) {
+            if (current->key == key) {
+                node_to_retire = current;
+                break;
             }
-            else
-            {
-                table[index].store(nextNode);
+            prev = current;
+            current = current->next.load(std::memory_order_acquire);
+
+        }
+
+        if (node_to_retire == nullptr) {
+            return false;
+        }
+
+        Node* next_after_removed = node_to_retire->next.load(std::memory_order_relaxed);
+        if (node_to_retire == current_head) { 
+            if (table[index].compare_exchange_weak(current_head, next_after_removed,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed)) {
+
+                scheduleDeferredDelete(node_to_retire);
+                size.fetch_sub(1, std::memory_order_relaxed);
+                return true;
             }
-            nodeToDelete = current;
-            removeLRUKey(key);
-    
-            size--;
-    
-            decrementRefCount(nextNode);
-            break;
+        } else {
+            if (prev && prev->next.compare_exchange_weak(node_to_retire, next_after_removed,
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed)) {                               
+                scheduleDeferredDelete(node_to_retire);
+                size.fetch_sub(1, std::memory_order_relaxed);
+                return true;
+            }
         }
-    
-        if (prev)
-        {
-            decrementRefCount(prev);
-        }
-    
-        prev=current;
-        current=nextNode;
-        }
-    if (nodeToDelete) {
-        safeDelete(nodeToDelete);
-
-        if (prev)
-        {
-            decrementRefCount(prev);
-        }
-        return true;
-    }
-    else{
-
-        if (current)
-        {
-            decrementRefCount(current);
-        }
-        if (prev)
-        {
-            decrementRefCount(prev);
-        }
-        return false;
-    }
-}
-
-void HashMap::deleteList(Node *head)
-{
-    while (head)
-    {
-        Node *temp=head;
-        head = head->next.load();
-        delete temp;
-    }
+    } while (true); 
+    return false;                                     
 }
 
 void HashMap::cleanupExpired() {
-    while (running) {
+    while (running.load(std::memory_order_relaxed)) {
         {
-            std::unique_lock<std::mutex> lock(expiryMutex);
-            expiryCV.wait_for(lock, std::chrono::seconds(2), [this]{ return !running; });
-            if (!running) break;
-        }
+            std::unique_lock<std::mutex> lock(expiryGlobalMutex);
+            if (expiryGlobalCV.wait_for(lock, std::chrono::seconds(10), [this] { return !running.load(std::memory_order_relaxed); })) {
+                if (!running.load(std::memory_order_relaxed)) break;
+            }
+        } 
+
+        if (!running.load(std::memory_order_relaxed)) break;
         
         time_t now = time(nullptr);
-        std::vector<std::string> keysToRemove;
+        std::vector<std::string> expired_keys;
         
         for (size_t i = 0; i < capacity; ++i) {
-            Node* prev = nullptr;
-            Node* current = table[i].load();
-            
-            // Protect current node
+            Node* current = table[i].load(std::memory_order_acquire);
             incrementRefCount(current);
             
-            while (current) {
-                // Protect next node
-                Node* nextNode = current->next.load();
-                incrementRefCount(nextNode);
-                
-                if (current->expiry && now > current->expiry) {
-                    // Collect key to remove from LRU later
-                    keysToRemove.push_back(current->key);
-                    
-                    // Remove expired node
-                    if (prev) {
-                        prev->next.store(nextNode);
-                    } else {
-                        table[i].store(nextNode);
-                    }
-                    
-                    // Schedule node for deletion
-                    Node* nodeToDelete = current;
-                    
-                    // Decrement size atomically
-                    size--;
-                    
-                    // Move to next node
-                    current = nextNode;
-                    
-                    // Safe delete after releasing reference
-                    safeDelete(nodeToDelete);
-                    
-                    // Release previous node if we have one
-                    if (prev) {
-                        decrementRefCount(prev);
-                    }
-                } else {
-                    // Release previous node if it exists
-                    if (prev) {
-                        decrementRefCount(prev);
-                    }
-                    
-                    // Move to next node
-                    prev = current;
-                    current = nextNode;
-                }
-            }
+            Node* node_iter = current;
             
-            // Release final node if we have one
-            if (prev) {
-                decrementRefCount(prev);
+            
+            while (node_iter != nullptr) {
+                
+                if (node_iter->expiry != 0 && now > node_iter->expiry) {
+                    expired_keys.push_back(node_iter->key); // Copy key
+                }
+                Node* next_node = node_iter->next.load(std::memory_order_acquire);
+                incrementRefCount(next_node);
+                decrementRefCount(node_iter); 
+                node_iter = next_node;
             }
+            if (node_iter) decrementRefCount(node_iter); 
+            else if (current) decrementRefCount(current);
         }
         
-        // Remove expired keys from LRU
-        for (const auto& key : keysToRemove) {
-            removeLRUKey(key);
+        for (const auto& key : expired_keys) {
+            this->remove(key);
         }
-    }
-}
-
-void HashMap::removeLRUKey(const std::string& key)
-{
-    std::lock_guard<std::mutex> lock(lruMutex);
-    auto it = lruMap.find(key);
-    if (it!=lruMap.end())
-    {
-        lruList.erase(it->second);
-        lruMap.erase(it);
-    }
-}
-
-void HashMap::workerFunction() {
-    while (workersRunning) {
-        std::shared_ptr<Task> task;
-        {
-            std::unique_lock<std::mutex> lock(taskMutex);
-            taskCV.wait(lock, [&]() {
-                return !taskQueue.empty() || !workersRunning;
-            });
-            if (!workersRunning && taskQueue.empty()) break;
-            if (!taskQueue.empty()) {
-                task = taskQueue.front();
-                taskQueue.pop();
-            } else {
-                continue;
-            }
-        }
-
-        try {
-            switch (task->type) {
-                case TaskType::SET:
-                    setInternal(task->key, task->value, task->ttl);
-                    task->result.set_value("OK");
-                    break;
-                case TaskType::GET:
-                    task->result.set_value(getInternal(task->key));
-                    break;
-                case TaskType::REMOVE:
-                    task->result.set_value(removeInternal(task->key) ? "OK" : "NOT_FOUND");
-                    break;
-            }
-        } catch (const std::exception& e) {
-            try {
-                task->result.set_exception(std::current_exception());
-            } catch (...) {
-                // Promise might be already satisfied
-            }
-        }
+        processDeferredDeletes();
     }
 }
 
@@ -444,89 +412,89 @@ void HashMap::updateLRU(const std::string &key) {
     }
     lruList.push_front(key);
     lruMap[key] = lruList.begin();
-    
-    // Check if we need to remove LRU items
-    if (lruList.size() > capacity) {
-        std::string lruKey = lruList.back();
-        lruList.pop_back();
-        lruMap.erase(lruKey);
-        
-        // Schedule removal in a separate task to avoid deadlock
-        auto task = std::make_shared<Task>(TaskType::REMOVE, lruKey);
-        {
-            std::lock_guard<std::mutex> lock(taskMutex);
-            taskQueue.push(task);
-        }
-        taskCV.notify_one();
-    }
 }
 
-void HashMap::removeLRUItem()
-{
-    std::string lruKey;
-    {
-        std::lock_guard<std::mutex> lock(lruMutex);
-        if (lruList.empty()) return;
-        lruKey = lruList.back();
-        lruList.pop_back();
-        lruMap.erase(lruKey);
-    }
-    removeInternal(lruKey);
-}
 
 void HashMap::lruMonitor() {
-    while (lruRunning) {
+    while (lruRunning.load(std::memory_order_relaxed)) {
         {
             std::unique_lock<std::mutex> lock(lruMutex);
-            lruCV.wait_for(lock, std::chrono::seconds(5), [this]{ return !lruRunning; });
-            if (!lruRunning) break;
+            if(lruCV.wait_for(lock, std::chrono::seconds(5), [this] { return !lruRunning.load(std::memory_order_relaxed); })) {
+                 if (!lruRunning.load(std::memory_order_relaxed)) break;
+            }
         }
+
+        if (!lruRunning.load(std::memory_order_relaxed)) break;
         
-        // Check if we need to evict items based on capacity
-        if (size > capacity * 0.9) {
-            std::string lruKey;
+        if (size.load(std::memory_order_acquire) > MAX_CAPACITY) {
+            std::string key_to_evict;
             {
                 std::lock_guard<std::mutex> lock(lruMutex);
                 if (!lruList.empty()) {
-                    lruKey = lruList.back();
+                    key_to_evict = lruList.back();
                     lruList.pop_back();
-                    lruMap.erase(lruKey);
+                    lruMap.erase(key_to_evict);
                 }
             }
-            
-            // If we have an LRU key to remove, schedule it
-            if (!lruKey.empty()) {
-                auto task = std::make_shared<Task>(TaskType::REMOVE, lruKey);
-                {
-                    std::lock_guard<std::mutex> lock(taskMutex);
-                    taskQueue.push(task);
-                }
-                taskCV.notify_one();
+            if (!key_to_evict.empty()) {
+                this->remove(key_to_evict);
             }
         }
+        processDeferredDeletes();
     }
 }
 
-void HashMap::print_map()
-{
-    for (size_t i = 0; i < capacity; ++i)
-    {
-        for (Node *node = table[i].load(); node; node = node->next)
-        {
-            std::cout << node->key << ": " << node->value << std::endl;
+void HashMap::print_map() const{
+    std::cout << "--- HashMap RCU (Size: " << size.load() << ", Capacity: " << capacity << ") ---" << std::endl;
+    for (size_t i = 0; i < capacity; ++i) {
+        Node* current = table[i].load(std::memory_order_acquire);
+        if (current) {
+            std::cout << "Bucket[" << i << "]: ";
+            incrementRefCount(current);
+            Node* p_iter = current;
+            while (p_iter) {
+                std::cout << "{" << p_iter->key << ":" << p_iter->value 
+                          << " (Refs: " << p_iter->refCount.load() 
+                          << ", Exp: " << p_iter->expiry << ")} -> ";
+                Node* next_p = p_iter->next.load(std::memory_order_acquire);
+                incrementRefCount(next_p);
+                decrementRefCount(p_iter);
+                p_iter = next_p;
+            }
+            if(p_iter) decrementRefCount(p_iter); 
+            else if(current) decrementRefCount(current); 
+            std::cout << "NULL" << std::endl;
         }
     }
+    std::cout << "--- End HashMap RCU ---" << std::endl;
 }
 
-// std::vector<std::pair<std::string, HashMap::Node>> HashMap::getAll() const
-// {
-//     std::vector<std::pair<std::string, Node>> result;
-//     for (size_t i = 0; i < capacity; ++i)
-//     {
-//         for (Node *node = table[i].load(); node; node = node->next)
-//         {
-//             result.emplace_back(node->key, *node);
-//         }
-//     }
-//     return result;
-// }
+std::vector<HashMap::NodeData> HashMap::getAllForPersistence() const{
+    std::vector<HashMap::NodeData> data;
+    data.reserve(size.load(std::memory_order_relaxed));
+
+    for (size_t i = 0; i < capacity; ++i) {
+        Node* current = table[i].load(std::memory_order_acquire);
+        incrementRefCount(current); 
+
+        Node* node_iter = current;
+        while (node_iter) {
+            NodeData nd = {
+                node_iter->key,
+                node_iter->value,
+                node_iter->expiry,
+                node_iter->lastAccessed.load(std::memory_order_relaxed)
+            };
+            data.push_back(nd);
+
+            Node* next_node = node_iter->next.load(std::memory_order_acquire);
+            incrementRefCount(next_node);
+            decrementRefCount(node_iter); 
+            node_iter = next_node;     
+        }
+        if (node_iter) decrementRefCount(node_iter); 
+        else if(current) decrementRefCount(current); 
+
+    }
+    return data;
+}

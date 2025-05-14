@@ -17,8 +17,8 @@
 #include <list>
 #include <unordered_map>
 
-const size_t INITIAL_CAPACITY = 16;
-const size_t MIN_CAPACITY = 16;
+const size_t INITIAL_CAPACITY = 2048;
+const size_t MIN_CAPACITY = 2048;
 const size_t MAX_CAPACITY = 2048;
 
 class HashMap
@@ -114,7 +114,7 @@ public:
 
 
     void print_map();
-    std::vector<std::pair<std::string, Node>> getAll() const;
+    //std::vector<std::pair<std::string, Node>> getAll() const;
     
 };
 
